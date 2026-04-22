@@ -2,9 +2,17 @@ import streamlit as st
 import json
 import re
 import time
+import os
 from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
+
+# --- LOKALEN .ENV FALLBACK (fürs Testen am PC) ---
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # --- KONFIGURATION ---
 BASE_URL = "https://leaguesphere.app"
@@ -14,6 +22,12 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; LeagueSphereUnified/Web)"}
 
 # --- UI SETUP ---
 st.set_page_config(page_title="LeagueSphere Scraper", page_icon="🏈", layout="centered")
+
+def get_secret(key):
+    """Holt die Zugangsdaten unsichtbar aus den Streamlit Secrets oder der lokalen .env"""
+    if hasattr(st, "secrets") and key in st.secrets:
+        return st.secrets[key]
+    return os.environ.get(key, "")
 
 @st.cache_data
 def load_team_mapping():
@@ -178,12 +192,10 @@ def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win):
     session = requests.Session()
     session.headers.update(HEADERS)
     team_mapping = load_team_mapping()
-    if team_mapping: log_cb(f"✅ teams.json geladen ({len(team_mapping)} Teams)")
-    else: log_cb("⚠ Keine teams.json gefunden!")
     
     login_success = False
     if user and pw:
-        log_cb(f"⬡ Sende Login-Daten...")
+        log_cb(f"⬡ Führe unsichtbaren Login durch...")
         resp = session.get(LOGIN_URL, timeout=10)
         soup = BeautifulSoup(resp.text, "html.parser")
         csrf = soup.find("input", {"name": "csrfmiddlewaretoken"})
@@ -193,7 +205,7 @@ def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win):
             log_cb("⚠ Login fehlgeschlagen! Roster können nicht ausgelesen werden.")
         else:
             login_success = True
-            log_cb("✅ Login erfolgreich!")
+            log_cb("✅ Login erfolgreich! (Roster-Zugriff gewährt)")
 
     url = f"{BASE_URL}/gamedays/gameday/{gameday_id}/"
     log_cb(f"⬡ Lade Spieltag {gameday_id}...")
@@ -260,7 +272,6 @@ def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win):
                                         if trikot and trikot not in rosters[full_name]: rosters[full_name][trikot] = name
                 except Exception as e: log_cb(f"  ⚠ Fehler bei {full_name}: {e}")
                 log_cb(f"  ↳ {full_name}: {len(rosters[full_name])} Spieler geladen.")
-            else: log_cb(f"  ⚠ Team nicht gefunden: {full_name}")
 
     total = len(data["games"])
     for i, g in enumerate(data["games"]):
@@ -268,7 +279,7 @@ def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win):
         h_abbr, a_abbr = g.pop("home_abbr", ""), g.pop("away_abbr", "")
         h_full, a_full = g["home_team"], g["away_team"]
         g["plays"] = parse_game_plays(g["url"], session, h_abbr, h_full, rosters.get(h_full, {}), a_abbr, a_full, rosters.get(a_full, {}))
-        prog_cb(int((i + 1) / total * 100))
+        prog_cb(float(i + 1) / total)
         
     for stat in data["scoring_plays"]: stat["player"] = translate_stat_player(stat["player"], team_mapping, rosters)
     for stat in data["defense_plays"]: stat["player"] = translate_stat_player(stat["player"], team_mapping, rosters)
@@ -280,47 +291,104 @@ st.write("Exporte den vollständigen Spieltag inkl. Roster und Play-by-Plays.")
 
 col1, col2 = st.columns(2)
 with col1:
-    gameday_id = st.text_input("Spieltag-ID", placeholder="z.B. 641")
+    # Neues Multi-ID Textfeld
+    gameday_ids_input = st.text_input("Spieltag-ID(s)", placeholder="z.B. 641, 642; 643")
 with col2:
     lp_per_win = st.number_input("LP pro Sieg", value=2.0, step=0.5)
 
-# Hier holt sich die App unsichtbar die Daten aus dem Tresor!
-secret_user = st.secrets.get("LS_USERNAME", "")
-secret_pass = st.secrets.get("LS_PASSWORD", "")
-
-with st.expander("Zugangsdaten (Optional überschreiben)"):
-    user_input = st.text_input("Username", value=secret_user)
-    pass_input = st.text_input("Passwort", value=secret_pass, type="password")
+with st.expander("🔑 Zugangsdaten (Optional überschreiben)"):
+    st.info("Deine sicheren Login-Daten (aus den Streamlit Secrets) arbeiten unsichtbar im Hintergrund! Du kannst sie hier bei Bedarf nur für diesen einen Durchlauf überschreiben.")
+    user_input = st.text_input("Username (Leer lassen für Standard)", value="", placeholder="Überschreiben...")
+    pass_input = st.text_input("Passwort (Leer lassen für Standard)", value="", type="password", placeholder="Überschreiben...")
 
 if st.button("▶ Daten jetzt exportieren", type="primary"):
-    if not gameday_id.isdigit():
-        st.error("Bitte eine gültige Spieltag-ID eingeben.")
+    
+    # IDs durch Regex splitten (Komma oder Semikolon)
+    raw_ids = re.split(r'[,;]+', gameday_ids_input)
+    gameday_ids = [int(i.strip()) for i in raw_ids if i.strip().isdigit()]
+
+    if not gameday_ids:
+        st.error("Bitte mindestens eine gültige Spieltag-ID eingeben.")
     else:
-        progress_bar = st.progress(0)
+        progress_bar = st.progress(0.0)
         log_container = st.empty()
         logs = []
 
         def update_log(msg):
             logs.append(msg)
-            # Behalte nur die letzten 15 Zeilen für die UI, damit es nicht laggt
-            log_container.code("\n".join(logs[-15:]), language="text")
+            log_container.code("\n".join(logs[-12:]), language="text")
 
-        def update_prog(val):
-            progress_bar.progress(val)
+        # Entscheidung: User-Eingabe ODER unsichtbare Secrets
+        final_user = user_input.strip() if user_input.strip() else get_secret("LS_USERNAME")
+        final_pass = pass_input.strip() if pass_input.strip() else get_secret("LS_PASSWORD")
 
-        with st.spinner("Scraping läuft... Bitte warten."):
+        with st.spinner(f"Scraping von {len(gameday_ids)} Spieltag(en) läuft..."):
             try:
-                final_data = scrape_unified(int(gameday_id), user_input, pass_input, update_log, update_prog, float(lp_per_win))
+                all_data = []
+                for idx, gid in enumerate(gameday_ids):
+                    update_log(f"\n=== STARTE SPIELTAG {gid} ({idx+1}/{len(gameday_ids)}) ===")
+                    
+                    def update_prog(val):
+                        # Berechnet den übergreifenden Fortschritt für alle eingegebenen IDs
+                        overall = (idx + val) / len(gameday_ids)
+                        progress_bar.progress(min(overall, 1.0))
+
+                    data = scrape_unified(gid, final_user, final_pass, update_log, update_prog, float(lp_per_win))
+                    all_data.append(data)
+
+                # --- DATEN UND DATEINAMEN ZUSAMMENFÜHREN ---
+                if len(all_data) == 1:
+                    # Single ID Modus
+                    final_json = all_data[0]
+                    d = final_json.get("date", "Unbekannt").split(",")[-1].strip()
+                    fn = re.sub(r'[\\/*?:"<>|]', "", f"Spieltag {final_json.get('league', '')} {final_json.get('name', '')} {d}.json")
+                    filename = re.sub(r'\s+', ' ', fn)
+                else:
+                    # Multi-ID Modus -> Alles in ein riesiges JSON mergen
+                    combined = {
+                        "is_multi_gameday": True,
+                        "gameday_ids": gameday_ids,
+                        "league": all_data[0].get("league", ""),
+                        "games": [],
+                        "scoring_plays": [],
+                        "defense_plays": [],
+                        "standings": all_data[-1].get("standings", []), # Nutze die aktuellsten Standings
+                        "overall_standings": all_data[-1].get("overall_standings", [])
+                    }
+                    
+                    parsed_dates = []
+                    for d in all_data:
+                        combined["games"].extend(d.get("games", []))
+                        combined["scoring_plays"].extend(d.get("scoring_plays", []))
+                        combined["defense_plays"].extend(d.get("defense_plays", []))
+                        
+                        raw_date = d.get("date", "")
+                        if "," in raw_date:
+                            date_part = raw_date.split(",")[-1].strip()
+                            date_no_year = re.sub(r'\s*\d{4}$', '', date_part).strip() # Jahr abschneiden
+                            if date_no_year and date_no_year not in parsed_dates:
+                                parsed_dates.append(date_no_year)
+                        else:
+                            if raw_date and raw_date not in parsed_dates:
+                                parsed_dates.append(raw_date)
+                    
+                    # Formatiert: "18. April und 19. April"
+                    if len(parsed_dates) > 1:
+                        date_str = " und ".join([", ".join(parsed_dates[:-1]), parsed_dates[-1]])
+                    elif len(parsed_dates) == 1:
+                        date_str = parsed_dates[0]
+                    else:
+                        date_str = "Unbekannt"
+                        
+                    filename = f"Spieltage {date_str}.json"
+                    final_json = combined
+
+                # Generiere Download-Button
+                json_string = json.dumps(final_json, ensure_ascii=False, indent=2)
+                st.success(f"✅ Erfolgreich! {len(gameday_ids)} Spieltag(e) verarbeitet.")
                 
-                d = final_data.get("date", "Unbekannt").split(",")[-1].strip()
-                fn = re.sub(r'[\\/*?:"<>|]', "", f"Spieltag {final_data['league']} {final_data['name']} {d}.json")
-                filename = re.sub(r'\s+', ' ', fn)
-                
-                json_string = json.dumps(final_data, ensure_ascii=False, indent=2)
-                
-                st.success("✅ Erfolgreich! Klicke unten, um die Datei herunterzuladen.")
                 st.download_button(
-                    label="📥 JSON Datei herunterladen",
+                    label=f"📥 Herunterladen: {filename}",
                     data=json_string,
                     file_name=filename,
                     mime="application/json"
