@@ -18,7 +18,7 @@ except ImportError:
 BASE_URL = "https://leaguesphere.app"
 LOGIN_URL = f"{BASE_URL}/login/"
 TEAM_LIST_URL = f"{BASE_URL}/passcheck/team/all/list/"
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; LeagueSphereUnified/Web)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; LeagueSphereUnified/Web-Guarded)"}
 
 # --- UI SETUP ---
 st.set_page_config(page_title="LeagueSphere Scraper", page_icon="🏈", layout="centered")
@@ -78,12 +78,15 @@ def translate_stat_player(player_text, mapping, rosters):
             return process_action(player_text, abbr, full_name, roster)
     return player_text
 
-# --- PARSER ---
-def parse_game_list(soup, gameday_id, mapping):
+# --- PARSER MIT STRUKTUR-ALARM ---
+def parse_game_list(soup, gameday_id, mapping, log_cb):
     games = []
+    table_found = False
     for table in soup.find_all("table"):
         headers = [clean(th.get_text()).lower() for th in table.find_all("th")]
         if "id" not in headers: continue
+        
+        table_found = True
         idx = {h: i for i, h in enumerate(headers)}
         pkt_indices = [i for i, h in enumerate(headers) if h == "pkt"]
         for row in table.find_all("tr")[1:]:
@@ -104,14 +107,21 @@ def parse_game_list(soup, gameday_id, mapping):
                 "status": get_cell(cells, idx, "status"), "plays": [] 
             })
         break
+    
+    if not table_found or not games:
+        log_cb("  ⚠ STRUKTUR-ALARM: Spieltags-Tabelle (Spalte 'ID') nicht gefunden! Hat LeagueSphere das Design geändert?")
+    
     return games
 
-def parse_standings(soup, mapping):
+def parse_standings(soup, mapping, log_cb, is_overall=False):
     standings = []
+    table_found = False
     for table in soup.find_all("table"):
         headers_raw = [clean(th.get_text()) for th in table.find_all("th")]
         headers = [h.split()[0].lower() if h else "" for h in headers_raw]
         if "rang" not in headers or ("sq" not in headers and "lp" not in headers): continue
+        
+        table_found = True
         idx = {h: i for i, h in enumerate(headers)}
         for row in table.find_all("tr")[1:]:
             cells = row.find_all("td")
@@ -136,13 +146,21 @@ def parse_standings(soup, mapping):
                 "round": get_cell(cells, idx, "runde"), "league_points": get_cell(cells, idx, "lp"),
             })
         break
+    
+    if not table_found and not is_overall:
+        log_cb("  ⚠ STRUKTUR-ALARM: Standings-Tabelle (Spalte 'Rang'/'SQ') nicht gefunden!")
+        
     return standings
 
-def parse_statistics(soup):
+def parse_statistics(soup, log_cb):
     scoring, defense = [], []
+    found_scoring = False
+    found_defense = False
+    
     for table in soup.find_all("table"):
         headers = [clean(th.get_text()).lower() for th in table.find_all("th")]
         if "touchdown" in headers and "punkte" in headers:
+            found_scoring = True
             idx = {h: i for i, h in enumerate(headers)}
             for row in table.find_all("tr")[1:]:
                 cells = row.find_all("td")
@@ -153,21 +171,31 @@ def parse_statistics(soup):
                     "extra_2pt": get_cell(cells, idx, "2-extra-punkte"), "points": get_cell(cells, idx, "punkte"),
                 })
         if "interceptions" in headers:
+            found_defense = True
             for row in table.find_all("tr")[1:]:
                 cells = row.find_all("td")
                 if len(cells) < 3: continue
                 defense.append({"rank": clean(cells[0].get_text()), "player": clean(cells[1].get_text()), "interceptions": clean(cells[2].get_text()), "type": "interception"})
                 if len(cells) >= 6 and clean(cells[3].get_text()):
                     defense.append({"rank": clean(cells[3].get_text()), "player": clean(cells[4].get_text()), "safeties": clean(cells[5].get_text()), "type": "safety"})
+                    
+    # Wir machen den Alarm hier optional, da manche Spieltage keine Defense-Stats haben
+    if not found_scoring:
+        log_cb("  ⚠ HINWEIS: Keine Scoring-Statistiken gefunden (Normal bei unvollständigen Spieltagen, sonst Struktur-Alarm).")
+        
     return scoring, defense
 
-def parse_game_plays(url, session, h_abbr, h_full, h_roster, a_abbr, a_full, a_roster):
+def parse_game_plays(url, session, h_abbr, h_full, h_roster, a_abbr, a_full, a_roster, log_cb):
     resp = session.get(url, timeout=15)
     soup = BeautifulSoup(resp.text, "html.parser")
     plays = []
+    table_found = False
+    
     for table in soup.find_all("table"):
         headers = [clean(th.get_text()).lower() for th in table.find_all("th")]
         if not any("spielstand" in h for h in headers): continue
+        
+        table_found = True
         for row in table.find_all("tr")[1:]:
             cells = row.find_all("td")
             if len(cells) < 3: continue
@@ -185,6 +213,10 @@ def parse_game_plays(url, session, h_abbr, h_full, h_roster, a_abbr, a_full, a_r
             if a_fail: play_dict["away_failed"] = True
             if play_dict: plays.append(play_dict)
         break 
+        
+    if not table_found:
+        log_cb(f"  ⚠ STRUKTUR-ALARM: Keine Plays (Spalte 'Spielstand') für {h_abbr} vs {a_abbr} gefunden!")
+        
     return plays
 
 # --- HAUPT LOGIK ---
@@ -205,7 +237,7 @@ def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win):
             log_cb("⚠ Login fehlgeschlagen! Roster können nicht ausgelesen werden.")
         else:
             login_success = True
-            log_cb("✅ Login erfolgreich! (Roster-Zugriff gewährt)")
+            log_cb("✅ Login erfolgreich!")
 
     url = f"{BASE_URL}/gamedays/gameday/{gameday_id}/"
     log_cb(f"⬡ Lade Spieltag {gameday_id}...")
@@ -218,16 +250,21 @@ def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win):
         elif "Datum:" in line: data["date"] = line.replace("Datum:", "").strip()
         elif "Turnierbeginn:" in line: data["start_time"] = line.replace("Turnierbeginn:", "").strip()
 
-    data["games"] = parse_game_list(soup, gameday_id, team_mapping)
-    data["standings"] = parse_standings(soup, team_mapping)
-    data["scoring_plays"], data["defense_plays"] = parse_statistics(soup)
+    addr = soup.find("a", href=lambda h: h and "http://googleusercontent.com/maps.google.com/" in h)
+    if addr: data["address"] = clean(addr.get_text())
+
+    # Übergabe der log_cb an die Parser
+    data["games"] = parse_game_list(soup, gameday_id, team_mapping, log_cb)
+    data["standings"] = parse_standings(soup, team_mapping, log_cb)
+    data["scoring_plays"], data["defense_plays"] = parse_statistics(soup, log_cb)
 
     l_map = {"DFFLF2": "dfflf2/", "DFFLF": "dfflf/", "DFFL2": "dffl2/", "DFFL": "dffl/"}
     suffix = next((v for k, v in l_map.items() if k in data["league"].upper()), None)
     if suffix:
         try:
-            data["overall_standings"] = parse_standings(fetch_page_expanded(f"{BASE_URL}/leaguetable/{suffix}", session), team_mapping)
-        except: pass
+            data["overall_standings"] = parse_standings(fetch_page_expanded(f"{BASE_URL}/leaguetable/{suffix}", session), team_mapping, log_cb, is_overall=True)
+        except Exception as e:
+            log_cb(f"  ⚠ Fehler beim Laden der Gesamttabelle: {e}")
 
     rosters = {}
     if login_success:
@@ -270,6 +307,8 @@ def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win):
                                     if len(cols) > max(t_idx, v_idx, n_idx):
                                         trikot, name = cols[t_idx], f"{cols[v_idx]} {cols[n_idx]}".strip()
                                         if trikot and trikot not in rosters[full_name]: rosters[full_name][trikot] = name
+                            else:
+                                log_cb(f"  ⚠ STRUKTUR-ALARM: Roster-Tabelle für {full_name} hat sich geändert (Spalten Trikot/Vorname/Nachname fehlen).")
                 except Exception as e: log_cb(f"  ⚠ Fehler bei {full_name}: {e}")
                 log_cb(f"  ↳ {full_name}: {len(rosters[full_name])} Spieler geladen.")
 
@@ -278,7 +317,9 @@ def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win):
         log_cb(f"  [{i+1}/{total}] Verarbeite: {g['home_team']} vs {g['away_team']}...")
         h_abbr, a_abbr = g.pop("home_abbr", ""), g.pop("away_abbr", "")
         h_full, a_full = g["home_team"], g["away_team"]
-        g["plays"] = parse_game_plays(g["url"], session, h_abbr, h_full, rosters.get(h_full, {}), a_abbr, a_full, rosters.get(a_full, {}))
+        
+        # Übergabe von log_cb
+        g["plays"] = parse_game_plays(g["url"], session, h_abbr, h_full, rosters.get(h_full, {}), a_abbr, a_full, rosters.get(a_full, {}), log_cb)
         prog_cb(float(i + 1) / total)
         
     for stat in data["scoring_plays"]: stat["player"] = translate_stat_player(stat["player"], team_mapping, rosters)
@@ -302,7 +343,6 @@ with st.expander("🔑 Zugangsdaten (Optional überschreiben)"):
 
 if st.button("▶ Daten jetzt exportieren", type="primary"):
     
-    # IDs durch Regex splitten (Komma oder Semikolon)
     raw_ids = re.split(r'[,;]+', gameday_ids_input)
     gameday_ids = [int(i.strip()) for i in raw_ids if i.strip().isdigit()]
 
@@ -315,9 +355,8 @@ if st.button("▶ Daten jetzt exportieren", type="primary"):
 
         def update_log(msg):
             logs.append(msg)
-            log_container.code("\n".join(logs[-12:]), language="text")
+            log_container.code("\n".join(logs[-15:]), language="text")
 
-        # Entscheidung: User-Eingabe ODER unsichtbare Secrets
         final_user = user_input.strip() if user_input.strip() else get_secret("LS_USERNAME")
         final_pass = pass_input.strip() if pass_input.strip() else get_secret("LS_PASSWORD")
 
@@ -347,7 +386,6 @@ if st.button("▶ Daten jetzt exportieren", type="primary"):
                             "overall_standings": []
                         }
                     
-                    # Erstelle das Gameday-Objekt
                     gameday_obj = {
                         "gameday_id": d.get("gameday_id"),
                         "url": d.get("url"),
@@ -362,11 +400,9 @@ if st.button("▶ Daten jetzt exportieren", type="primary"):
                     }
                     structured_data[league_name]["gamedays"].append(gameday_obj)
                     
-                    # Aktuellste Gesamttabelle für die Liga übernehmen
                     if d.get("overall_standings"):
                         structured_data[league_name]["overall_standings"] = d.get("overall_standings")
                         
-                    # Daten für Dateinamen extrahieren
                     raw_date = d.get("date", "")
                     if "," in raw_date:
                         date_part = raw_date.split(",")[-1].strip()
@@ -381,12 +417,10 @@ if st.button("▶ Daten jetzt exportieren", type="primary"):
 
                 # --- DATEINAMEN GENERIEREN ---
                 if len(all_data) == 1:
-                    # Single ID Modus
                     d = all_data[0].get("date", "Unbekannt").split(",")[-1].strip()
                     fn = re.sub(r'[\\/*?:"<>|]', "", f"Spieltag {all_data[0].get('league', '')} {all_data[0].get('name', '')} {d}.json")
                     filename = re.sub(r'\s+', ' ', fn)
                 else:
-                    # Multi-ID Modus
                     if len(parsed_dates) > 1:
                         date_str = " und ".join([", ".join(parsed_dates[:-1]), parsed_dates[-1]])
                     elif len(parsed_dates) == 1:
@@ -395,7 +429,6 @@ if st.button("▶ Daten jetzt exportieren", type="primary"):
                         date_str = "Unbekannt"
                     filename = f"Spieltage {date_str}.json"
 
-                # Download-Button anzeigen
                 json_string = json.dumps(final_json, ensure_ascii=False, indent=2)
                 st.success(f"✅ Erfolgreich! {len(gameday_ids)} Spieltag(e) in strukturierter JSON verarbeitet.")
                 
