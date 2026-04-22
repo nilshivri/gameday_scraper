@@ -291,7 +291,6 @@ st.write("Exporte den vollständigen Spieltag inkl. Roster und Play-by-Plays.")
 
 col1, col2 = st.columns(2)
 with col1:
-    # Neues Multi-ID Textfeld
     gameday_ids_input = st.text_input("Spieltag-ID(s)", placeholder="z.B. 641, 642; 643")
 with col2:
     lp_per_win = st.number_input("LP pro Sieg", value=2.0, step=0.5)
@@ -329,63 +328,76 @@ if st.button("▶ Daten jetzt exportieren", type="primary"):
                     update_log(f"\n=== STARTE SPIELTAG {gid} ({idx+1}/{len(gameday_ids)}) ===")
                     
                     def update_prog(val):
-                        # Berechnet den übergreifenden Fortschritt für alle eingegebenen IDs
                         overall = (idx + val) / len(gameday_ids)
                         progress_bar.progress(min(overall, 1.0))
 
                     data = scrape_unified(gid, final_user, final_pass, update_log, update_prog, float(lp_per_win))
                     all_data.append(data)
 
-                # --- DATEN UND DATEINAMEN ZUSAMMENFÜHREN ---
+                # --- STRUKTURIERUNG NACH LIGEN ---
+                structured_data = {}
+                parsed_dates = []
+                
+                for d in all_data:
+                    league_name = d.get("league", "Unbekannt Liga")
+                    if league_name not in structured_data:
+                        structured_data[league_name] = {
+                            "league": league_name,
+                            "gamedays": [],
+                            "overall_standings": []
+                        }
+                    
+                    # Erstelle das Gameday-Objekt
+                    gameday_obj = {
+                        "gameday_id": d.get("gameday_id"),
+                        "url": d.get("url"),
+                        "name": d.get("name"),
+                        "date": d.get("date"),
+                        "start_time": d.get("start_time"),
+                        "address": d.get("address"),
+                        "games": d.get("games", []),
+                        "standings": d.get("standings", []),
+                        "scoring_plays": d.get("scoring_plays", []),
+                        "defense_plays": d.get("defense_plays", [])
+                    }
+                    structured_data[league_name]["gamedays"].append(gameday_obj)
+                    
+                    # Aktuellste Gesamttabelle für die Liga übernehmen
+                    if d.get("overall_standings"):
+                        structured_data[league_name]["overall_standings"] = d.get("overall_standings")
+                        
+                    # Daten für Dateinamen extrahieren
+                    raw_date = d.get("date", "")
+                    if "," in raw_date:
+                        date_part = raw_date.split(",")[-1].strip()
+                        date_no_year = re.sub(r'\s*\d{4}$', '', date_part).strip()
+                        if date_no_year and date_no_year not in parsed_dates:
+                            parsed_dates.append(date_no_year)
+                    else:
+                        if raw_date and raw_date not in parsed_dates:
+                            parsed_dates.append(raw_date)
+
+                final_json = structured_data
+
+                # --- DATEINAMEN GENERIEREN ---
                 if len(all_data) == 1:
                     # Single ID Modus
-                    final_json = all_data[0]
-                    d = final_json.get("date", "Unbekannt").split(",")[-1].strip()
-                    fn = re.sub(r'[\\/*?:"<>|]', "", f"Spieltag {final_json.get('league', '')} {final_json.get('name', '')} {d}.json")
+                    d = all_data[0].get("date", "Unbekannt").split(",")[-1].strip()
+                    fn = re.sub(r'[\\/*?:"<>|]', "", f"Spieltag {all_data[0].get('league', '')} {all_data[0].get('name', '')} {d}.json")
                     filename = re.sub(r'\s+', ' ', fn)
                 else:
-                    # Multi-ID Modus -> Alles in ein riesiges JSON mergen
-                    combined = {
-                        "is_multi_gameday": True,
-                        "gameday_ids": gameday_ids,
-                        "league": all_data[0].get("league", ""),
-                        "games": [],
-                        "scoring_plays": [],
-                        "defense_plays": [],
-                        "standings": all_data[-1].get("standings", []), # Nutze die aktuellsten Standings
-                        "overall_standings": all_data[-1].get("overall_standings", [])
-                    }
-                    
-                    parsed_dates = []
-                    for d in all_data:
-                        combined["games"].extend(d.get("games", []))
-                        combined["scoring_plays"].extend(d.get("scoring_plays", []))
-                        combined["defense_plays"].extend(d.get("defense_plays", []))
-                        
-                        raw_date = d.get("date", "")
-                        if "," in raw_date:
-                            date_part = raw_date.split(",")[-1].strip()
-                            date_no_year = re.sub(r'\s*\d{4}$', '', date_part).strip() # Jahr abschneiden
-                            if date_no_year and date_no_year not in parsed_dates:
-                                parsed_dates.append(date_no_year)
-                        else:
-                            if raw_date and raw_date not in parsed_dates:
-                                parsed_dates.append(raw_date)
-                    
-                    # Formatiert: "18. April und 19. April"
+                    # Multi-ID Modus
                     if len(parsed_dates) > 1:
                         date_str = " und ".join([", ".join(parsed_dates[:-1]), parsed_dates[-1]])
                     elif len(parsed_dates) == 1:
                         date_str = parsed_dates[0]
                     else:
                         date_str = "Unbekannt"
-                        
                     filename = f"Spieltage {date_str}.json"
-                    final_json = combined
 
-                # Generiere Download-Button
+                # Download-Button anzeigen
                 json_string = json.dumps(final_json, ensure_ascii=False, indent=2)
-                st.success(f"✅ Erfolgreich! {len(gameday_ids)} Spieltag(e) verarbeitet.")
+                st.success(f"✅ Erfolgreich! {len(gameday_ids)} Spieltag(e) in strukturierter JSON verarbeitet.")
                 
                 st.download_button(
                     label=f"📥 Herunterladen: {filename}",
