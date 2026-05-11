@@ -24,6 +24,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; LeagueSphereUnified/Web-Guard
 st.set_page_config(page_title="LeagueSphere Scraper", page_icon="🏈", layout="centered")
 
 def get_secret(key):
+    """Holt die Zugangsdaten unsichtbar aus den Streamlit Secrets oder der lokalen .env"""
     if hasattr(st, "secrets") and key in st.secrets:
         return st.secrets[key]
     return os.environ.get(key, "")
@@ -108,7 +109,7 @@ def parse_game_list(soup, gameday_id, mapping, log_cb):
         break
     
     if not table_found or not games:
-        log_cb("  ⚠ STRUKTUR-ALARM: Spieltags-Tabelle (Spalte 'ID') nicht gefunden! Hat LeagueSphere das Design geändert oder gibt es hier noch keine Spiele?")
+        log_cb("  ⚠ STRUKTUR-ALARM: Spieltags-Tabelle (Spalte 'ID') nicht gefunden!")
     
     return games
 
@@ -177,7 +178,7 @@ def parse_statistics(soup, log_cb):
                     defense.append({"rank": clean(cells[3].get_text()), "player": clean(cells[4].get_text()), "safeties": clean(cells[5].get_text()), "type": "safety"})
                     
     if not found_scoring:
-        log_cb("  ⚠ HINWEIS: Keine Scoring-Statistiken gefunden (Normal bei unvollständigen Spieltagen).")
+        log_cb("  ⚠ HINWEIS: Keine Scoring-Statistiken gefunden.")
         
     return scoring, defense
 
@@ -222,7 +223,6 @@ def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win, only_results=F
     team_mapping = load_team_mapping()
     
     login_success = False
-    # IMMER einloggen, wenn Daten da sind – auch im Nur-Ergebnisse-Modus, da sonst der Spielplan oft versteckt bleibt!
     if user and pw:
         log_cb(f"⬡ Führe unsichtbaren Login durch...")
         resp = session.get(LOGIN_URL, timeout=10)
@@ -244,11 +244,35 @@ def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win, only_results=F
     soup = fetch_page_expanded(url, session)
     
     data = {"gameday_id": gameday_id, "url": url, "name": "", "league": "", "date": "", "start_time": "", "address": "", "games": [], "standings": [], "scoring_plays": [], "defense_plays": [], "overall_standings": []}
+    
     if soup.find("h1"): data["name"] = clean(soup.find("h1").get_text())
-    for line in soup.get_text(separator="\n").splitlines():
-        if "Liga:" in line: data["league"] = line.replace("Liga:", "").strip()
-        elif "Datum:" in line: data["date"] = line.replace("Datum:", "").strip()
-        elif "Turnierbeginn:" in line: data["start_time"] = line.replace("Turnierbeginn:", "").strip()
+    
+    # KUGELSICHERER METADATEN-PARSER
+    lines = [line.strip() for line in soup.get_text(separator="\n").splitlines() if line.strip()]
+    for idx, line in enumerate(lines):
+        # 1. LIGA
+        if line == "Liga:":
+            if idx + 1 < len(lines): data["league"] = lines[idx+1]
+        elif line.startswith("Liga:"):
+            val = line.replace("Liga:", "").strip()
+            if val: data["league"] = val
+            elif idx + 1 < len(lines): data["league"] = lines[idx+1]
+            
+        # 2. DATUM
+        if line == "Datum:":
+            if idx + 1 < len(lines): data["date"] = lines[idx+1]
+        elif line.startswith("Datum:"):
+            val = line.replace("Datum:", "").strip()
+            if val: data["date"] = val
+            elif idx + 1 < len(lines): data["date"] = lines[idx+1]
+            
+        # 3. TURNIERBEGINN
+        if line == "Turnierbeginn:":
+            if idx + 1 < len(lines): data["start_time"] = lines[idx+1]
+        elif line.startswith("Turnierbeginn:"):
+            val = line.replace("Turnierbeginn:", "").strip()
+            if val: data["start_time"] = val
+            elif idx + 1 < len(lines): data["start_time"] = lines[idx+1]
 
     addr = soup.find("a", href=lambda h: h and "http://googleusercontent.com/maps.google.com/" in h)
     if addr: data["address"] = clean(addr.get_text())
@@ -285,8 +309,7 @@ def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win, only_results=F
     if suffix:
         try:
             data["overall_standings"] = parse_standings(fetch_page_expanded(f"{BASE_URL}/leaguetable/{suffix}", session), team_mapping, log_cb, is_overall=True)
-        except Exception as e:
-            log_cb(f"  ⚠ Fehler beim Laden der Gesamttabelle: {e}")
+        except: pass
 
     rosters = {}
     if login_success:
@@ -329,8 +352,6 @@ def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win, only_results=F
                                     if len(cols) > max(t_idx, v_idx, n_idx):
                                         trikot, name = cols[t_idx], f"{cols[v_idx]} {cols[n_idx]}".strip()
                                         if trikot and trikot not in rosters[full_name]: rosters[full_name][trikot] = name
-                            else:
-                                log_cb(f"  ⚠ STRUKTUR-ALARM: Roster-Tabelle für {full_name} fehlerhaft.")
                 except Exception as e: log_cb(f"  ⚠ Fehler bei {full_name}: {e}")
                 log_cb(f"  ↳ {full_name}: {len(rosters[full_name])} Spieler geladen.")
 
@@ -339,7 +360,6 @@ def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win, only_results=F
         log_cb(f"  [{i+1}/{total}] Verarbeite Plays: {g['home_team']} vs {g['away_team']}...")
         h_abbr, a_abbr = g.pop("home_abbr", ""), g.pop("away_abbr", "")
         h_full, a_full = g["home_team"], g["away_team"]
-        
         g["plays"] = parse_game_plays(g["url"], session, h_abbr, h_full, rosters.get(h_full, {}), a_abbr, a_full, rosters.get(a_full, {}), log_cb)
         prog_cb(float(i + 1) / total)
         
@@ -360,7 +380,7 @@ with col2:
 only_results_checkbox = st.checkbox("✅ Nur Spielergebnisse scrapen (Schnellmodus ohne Plays/Tabellen/Roster)", value=False)
 
 with st.expander("🔑 Zugangsdaten (Optional überschreiben)"):
-    st.info("Deine sicheren Login-Daten arbeiten unsichtbar im Hintergrund! Du kannst sie hier bei Bedarf nur für diesen einen Durchlauf überschreiben.")
+    st.info("Deine sicheren Login-Daten (aus den Streamlit Secrets) arbeiten unsichtbar im Hintergrund! Du kannst sie hier bei Bedarf nur für diesen einen Durchlauf überschreiben.")
     user_input = st.text_input("Username (Leer lassen für Standard)", value="", placeholder="Überschreiben...")
     pass_input = st.text_input("Passwort (Leer lassen für Standard)", value="", type="password", placeholder="Überschreiben...")
 
@@ -413,7 +433,6 @@ if st.button("▶ Daten jetzt exportieren", type="primary"):
                         if not only_results_checkbox:
                             structured_data[league_name]["overall_standings"] = []
 
-                    # Modus-abhängiges Einfügen
                     if only_results_checkbox:
                         gameday_obj = {
                             "gameday_id": d.get("gameday_id"),
