@@ -217,7 +217,10 @@ def parse_game_plays(url, session, h_abbr, h_full, h_roster, a_abbr, a_full, a_r
     return plays
 
 # --- HAUPT LOGIK ---
-def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win, only_results=False):
+def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win, only_results=False, fetched_leagues=None):
+    if fetched_leagues is None:
+        fetched_leagues = set()
+        
     session = requests.Session()
     session.headers.update(HEADERS)
     team_mapping = load_team_mapping()
@@ -247,7 +250,6 @@ def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win, only_results=F
     
     if soup.find("h1"): data["name"] = clean(soup.find("h1").get_text())
     
-    # Metadaten-Parser
     lines = [line.strip() for line in soup.get_text(separator="\n").splitlines() if line.strip()]
     for idx, line in enumerate(lines):
         if line == "Liga:":
@@ -271,21 +273,27 @@ def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win, only_results=F
             if val: data["start_time"] = val
             elif idx + 1 < len(lines): data["start_time"] = lines[idx+1]
 
-    # FIX: Robustere Adress-Erkennung, fängt alle google.com/maps Links ab
-    addr = soup.find("a", href=lambda h: h and "google.com/maps" in h)
+    addr = soup.find("a", href=lambda h: h and "http://googleusercontent.com/maps.google.com/" in h)
     if addr: data["address"] = clean(addr.get_text())
 
     data["games"] = parse_game_list(soup, gameday_id, team_mapping, log_cb)
 
     # -----------------------------------------------------------------------
-    # NEU: Gesamttabelle wird IMMER geladen, auch im Schnellmodus
+    # Gesamttabelle laden - Gedächtnis prüft, ob Liga schon geladen wurde
     # -----------------------------------------------------------------------
-    l_map = {"DFFLF2": "dfflf2/", "DFFLF": "dfflf/", "DFFL2": "dffl2/", "DFFL": "dffl/"}
-    suffix = next((v for k, v in l_map.items() if k in data["league"].upper()), None)
-    if suffix:
-        try:
-            data["overall_standings"] = parse_standings(fetch_page_expanded(f"{BASE_URL}/leaguetable/{suffix}", session), team_mapping, log_cb, is_overall=True)
-        except: pass
+    league_key = data["league"].strip()
+    if league_key and league_key not in fetched_leagues:
+        l_map = {"DFFLF2": "dfflf2/", "DFFLF": "dfflf/", "DFFL2": "dffl2/", "DFFL": "dffl/"}
+        suffix = next((v for k, v in l_map.items() if k in league_key.upper()), None)
+        if suffix:
+            try:
+                log_cb(f"⬡ Lade Gesamttabelle für Liga '{league_key}'...")
+                data["overall_standings"] = parse_standings(fetch_page_expanded(f"{BASE_URL}/leaguetable/{suffix}", session), team_mapping, log_cb, is_overall=True)
+                fetched_leagues.add(league_key)
+            except Exception as e:
+                log_cb(f"  ⚠ Fehler beim Laden der Gesamttabelle: {e}")
+    elif league_key in fetched_leagues:
+        log_cb(f"⬡ Gesamttabelle für '{league_key}' liegt bereits vor (überspringe).")
 
     # --- EARLY RETURN FÜR DEN NUR-ERGEBNISSE MODUS ---
     if only_results:
@@ -299,14 +307,14 @@ def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win, only_results=F
             results_formatted.append(f"{g.get('home_team', '?')} vs. {g.get('away_team', '?')} {score_str}")
         
         prog_cb(1.0)
-        log_cb("✅ Ergebnisse und Gesamttabelle erfolgreich extrahiert.")
+        log_cb("✅ Ergebnisse erfolgreich extrahiert.")
         return {
             "gameday_id": gameday_id,
             "name": data["name"],
             "league": data["league"],
             "date": data["date"],
             "results": results_formatted,
-            "overall_standings": data["overall_standings"] # Direkt anhängen
+            "overall_standings": data.get("overall_standings", [])
         }
 
     # --- WEITER MIT REGULÄREM ABLAUF ---
@@ -411,6 +419,8 @@ if st.button("▶ Daten jetzt exportieren", type="primary"):
         with st.spinner(f"Scraping von {len(gameday_ids)} Spieltag(en) läuft..."):
             try:
                 all_data = []
+                fetched_leagues = set() # Speicher für bereits abgerufene Ligen
+                
                 for idx, gid in enumerate(gameday_ids):
                     update_log(f"\n=== STARTE SPIELTAG {gid} ({idx+1}/{len(gameday_ids)}) ===")
                     
@@ -418,7 +428,7 @@ if st.button("▶ Daten jetzt exportieren", type="primary"):
                         overall = (idx + val) / len(gameday_ids)
                         progress_bar.progress(min(overall, 1.0))
 
-                    data = scrape_unified(gid, final_user, final_pass, update_log, update_prog, float(lp_per_win), only_results_checkbox)
+                    data = scrape_unified(gid, final_user, final_pass, update_log, update_prog, float(lp_per_win), only_results_checkbox, fetched_leagues)
                     all_data.append(data)
 
                 # --- STRUKTURIERUNG NACH LIGEN ---
@@ -430,7 +440,7 @@ if st.button("▶ Daten jetzt exportieren", type="primary"):
                     if not league_name:
                         league_name = "Unbekannte Liga"
 
-                    # Wenn Liga noch nicht existiert, Struktur aufbauen (overall_standings GANZ OBEN)
+                    # Grundstruktur für Liga aufbauen
                     if league_name not in structured_data:
                         structured_data[league_name] = {
                             "league": league_name,
@@ -438,7 +448,7 @@ if st.button("▶ Daten jetzt exportieren", type="primary"):
                             "gamedays": []
                         }
 
-                    # Modus-abhängiges Einfügen der Spieltage
+                    # Spieltagsobjekt einfügen
                     if only_results_checkbox:
                         gameday_obj = {
                             "gameday_id": d.get("gameday_id"),
@@ -462,7 +472,7 @@ if st.button("▶ Daten jetzt exportieren", type="primary"):
                         
                     structured_data[league_name]["gamedays"].append(gameday_obj)
                     
-                    # Gesamttabelle aktualisieren, falls vorhanden (auch im Schnellmodus!)
+                    # Gesamttabelle aktualisieren (Greift nur 1x pro Liga, da d.get("overall_standings") danach leer ist)
                     if d.get("overall_standings"):
                         structured_data[league_name]["overall_standings"] = d.get("overall_standings")
                         
