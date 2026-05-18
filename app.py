@@ -78,6 +78,93 @@ def translate_stat_player(player_text, mapping, rosters):
             return process_action(player_text, abbr, full_name, roster)
     return player_text
 
+# --- NEUER PARSER: ZENTRALE ROSTERSEITE (MATCHREPORT) ---
+def fetch_matchreport_rosters(gameday_id, session, needed_full_teams, log_cb):
+    rosters = {team: {} for team in needed_full_teams}
+    url = f"{BASE_URL}/matchreport/gameday/{gameday_id}/"
+    
+    try:
+        log_cb(f"⬡ Rufe zentralen Matchreport für Roster ab: {url}")
+        resp = session.get(url, timeout=15)
+        if resp.status_code != 200:
+            log_cb(f"  ⚠ Matchreport-Seite konnte nicht geladen werden (Status: {resp.status_code})")
+            return rosters
+            
+        soup = BeautifulSoup(resp.text, "html.parser")
+        
+        # Finde alle Tab-Buttons für die Rosterlisten
+        buttons = soup.select("ul.nav-tabs button[data-bs-target]")
+        if not buttons:
+            buttons = soup.find_all("button", attrs={"data-bs-target": True})
+            
+        if not buttons:
+            log_cb("  ⚠ STRUKTUR-ALARM: Keine Roster-Tabs auf der Matchreport-Seite gefunden!")
+            return rosters
+            
+        log_cb(f"  ↳ {len(buttons)} Roster-Tabs auf der Seite erkannt.")
+        
+        for btn in buttons:
+            btn_text = clean(btn.get_text())
+            target_id = btn.get("data-bs-target", "").replace("#", "").strip()
+            if not target_id:
+                continue
+                
+            # Extrahiere reinen Teamnamen (entferne z.B. "(12 Spieler)")
+            tab_team_name = re.sub(r'\s*\(\d+\s*Spieler\)\s*', '', btn_text).strip()
+            
+            # Finde den dazugehörigen Tab-Inhalt
+            pane = soup.find("div", id=target_id)
+            if not pane:
+                continue
+                
+            table = pane.find("table")
+            if not table:
+                continue
+                
+            # Ordne den Tab dem passenden Stammverein zu (Substring-Matching)
+            matched_base_team = None
+            for needed_team in needed_full_teams:
+                if needed_team.lower() in tab_team_name.lower() or tab_team_name.lower() in needed_team.lower():
+                    matched_base_team = needed_team
+                    break
+                    
+            if not matched_base_team:
+                continue
+                
+            # Tabelle auslesen
+            headers = [clean(th.get_text()).lower() for th in table.find_all("th")]
+            
+            # Flexibler Spalten-Index für Trikot / Trikotnr.
+            t_idx = -1
+            for i, h in enumerate(headers):
+                if "trikot" in h:
+                    t_idx = i
+                    break
+            v_idx = headers.index("vorname") if "vorname" in headers else -1
+            n_idx = headers.index("nachname") if "nachname" in headers else -1
+            
+            if t_idx != -1 and v_idx != -1 and n_idx != -1:
+                player_count = 0
+                rows = table.find("tbody").find_all("tr") if table.find("tbody") else table.find_all("tr")[1:]
+                for row in rows:
+                    cols = [clean(td.get_text()) for td in row.find_all("td")]
+                    if len(cols) > max(t_idx, v_idx, n_idx):
+                        trikot = cols[t_idx]
+                        name = f"{cols[v_idx]} {cols[n_idx]}".strip()
+                        
+                        # First come, first serve: Nummern der Hauptmannschaft werden nicht überschrieben
+                        if trikot and trikot not in rosters[matched_base_team]:
+                            rosters[matched_base_team][trikot] = name
+                            player_count += 1
+                log_cb(f"    ✔️ Tab '{tab_team_name}' -> {player_count} neue(e) Spieler zu '{matched_base_team}' hinzugefügt.")
+            else:
+                log_cb(f"    ⚠ STRUKTUR-ALARM: Tabellen-Spalten im Tab '{tab_team_name}' wurden nicht erkannt (Headers: {headers})")
+                
+    except Exception as e:
+        log_cb(f"  ⚠ Fehler beim Parsen des Matchreports: {e}")
+        
+    return rosters
+
 # --- PARSER MIT STRUKTUR-ALARM ---
 def parse_game_list(soup, gameday_id, mapping, log_cb):
     games = []
@@ -273,14 +360,13 @@ def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win, only_results=F
             if val: data["start_time"] = val
             elif idx + 1 < len(lines): data["start_time"] = lines[idx+1]
 
-    addr = soup.find("a", href=lambda h: h and "http://googleusercontent.com/maps.google.com/" in h)
+    # FIX: Fängt jetzt flexibel alle Arten von Google Maps Links ab
+    addr = soup.find("a", href=lambda h: h and "google.com/maps" in h or "googleusercontent.com/maps" in h)
     if addr: data["address"] = clean(addr.get_text())
 
     data["games"] = parse_game_list(soup, gameday_id, team_mapping, log_cb)
 
-    # -----------------------------------------------------------------------
     # Gesamttabelle laden - Gedächtnis prüft, ob Liga schon geladen wurde
-    # -----------------------------------------------------------------------
     league_key = data["league"].strip()
     if league_key and league_key not in fetched_leagues:
         l_map = {"DFFLF2": "dfflf2/", "DFFLF": "dfflf/", "DFFL2": "dffl2/", "DFFL": "dffl/"}
@@ -321,51 +407,13 @@ def scrape_unified(gameday_id, user, pw, log_cb, prog_cb, lp_win, only_results=F
     data["standings"] = parse_standings(soup, team_mapping, log_cb)
     data["scoring_plays"], data["defense_plays"] = parse_statistics(soup, log_cb)
 
+    # -----------------------------------------------------------------------
+    # NEUE ROSTER-LOGIK: NUTZT JETZT DIE ZENTRALE MATCHREPORT-URL
+    # -----------------------------------------------------------------------
     rosters = {}
     if login_success:
-        log_cb("⬡ Sammle Teamliste für Roster...")
-        all_teams = []
-        try:
-            s_list = BeautifulSoup(session.get(TEAM_LIST_URL, timeout=10).text, "html.parser")
-            for a in s_list.select("table a[href*='/passcheck/team/']"):
-                all_teams.append({"name": a.get_text(strip=True), "url": urljoin(BASE_URL, a["href"])})
-        except: pass
-
         needed_full_teams = set([g["home_team"] for g in data["games"]] + [g["away_team"] for g in data["games"]])
-        for full_name in needed_full_teams:
-            if not full_name: continue
-            rosters[full_name] = {}
-            match = next((t for t in all_teams if full_name.lower() == t["name"].lower().strip()), None)
-            if not match: match = next((t for t in all_teams if full_name.lower() in t["name"].lower() or t["name"].lower() in full_name.lower()), None)
-
-            if match:
-                urls_to_fetch = [match["url"]]
-                try:
-                    main_soup = BeautifulSoup(session.get(match["url"], timeout=10).text, "html.parser")
-                    for a in main_soup.select("ul.nav-pills a.nav-link"):
-                        href = a.get("href", "")
-                        if "/passcheck/team/" in href and not re.search(r'/\d{4}/?$', href):
-                            sub_url = urljoin(BASE_URL, href)
-                            if sub_url not in urls_to_fetch: urls_to_fetch.append(sub_url)
-                    
-                    for u in urls_to_fetch:
-                        r_soup = main_soup if u == match["url"] else BeautifulSoup(session.get(u, timeout=10).text, "html.parser")
-                        rt = r_soup.find("table")
-                        if rt:
-                            headers = [th.get_text(strip=True).lower() for th in rt.find_all("th")]
-                            t_idx = headers.index("trikot") if "trikot" in headers else -1
-                            v_idx = headers.index("vorname") if "vorname" in headers else -1
-                            n_idx = headers.index("nachname") if "nachname" in headers else -1
-                            if t_idx != -1 and v_idx != -1 and n_idx != -1:
-                                for row in rt.find_all("tr")[1:]:
-                                    cols = [td.get_text(strip=True) for td in row.find_all("td")]
-                                    if len(cols) > max(t_idx, v_idx, n_idx):
-                                        trikot, name = cols[t_idx], f"{cols[v_idx]} {cols[n_idx]}".strip()
-                                        if trikot and trikot not in rosters[full_name]: rosters[full_name][trikot] = name
-                            else:
-                                log_cb(f"  ⚠ STRUKTUR-ALARM: Roster-Tabelle für {full_name} fehlerhaft.")
-                except Exception as e: log_cb(f"  ⚠ Fehler bei {full_name}: {e}")
-                log_cb(f"  ↳ {full_name}: {len(rosters[full_name])} Spieler geladen.")
+        rosters = fetch_matchreport_rosters(gameday_id, session, needed_full_teams, log_cb)
 
     total = len(data["games"])
     for i, g in enumerate(data["games"]):
@@ -393,7 +441,7 @@ with col2:
 only_results_checkbox = st.checkbox("✅ Nur Spielergebnisse scrapen (Schnellmodus ohne Plays/Tabellen/Roster)", value=False)
 
 with st.expander("🔑 Zugangsdaten (Optional überschreiben)"):
-    st.info("Deine sicheren Login-Daten (aus den Streamlit Secrets) arbeiten unsichtbar im Hintergrund! Du kannst sie hier bei Bedarf nur für diesen einen Durchlauf überschreiben.")
+    st.info("Deine sicheren Login-Daten arbeiten unsichtbar im Hintergrund! Du kannst sie hier bei Bedarf nur für diesen einen Durchlauf überschreiben.")
     user_input = st.text_input("Username (Leer lassen für Standard)", value="", placeholder="Überschreiben...")
     pass_input = st.text_input("Passwort (Leer lassen für Standard)", value="", type="password", placeholder="Überschreiben...")
 
@@ -419,7 +467,7 @@ if st.button("▶ Daten jetzt exportieren", type="primary"):
         with st.spinner(f"Scraping von {len(gameday_ids)} Spieltag(en) läuft..."):
             try:
                 all_data = []
-                fetched_leagues = set() # Speicher für bereits abgerufene Ligen
+                fetched_leagues = set() 
                 
                 for idx, gid in enumerate(gameday_ids):
                     update_log(f"\n=== STARTE SPIELTAG {gid} ({idx+1}/{len(gameday_ids)}) ===")
@@ -440,7 +488,6 @@ if st.button("▶ Daten jetzt exportieren", type="primary"):
                     if not league_name:
                         league_name = "Unbekannte Liga"
 
-                    # Grundstruktur für Liga aufbauen
                     if league_name not in structured_data:
                         structured_data[league_name] = {
                             "league": league_name,
@@ -448,7 +495,6 @@ if st.button("▶ Daten jetzt exportieren", type="primary"):
                             "gamedays": []
                         }
 
-                    # Spieltagsobjekt einfügen
                     if only_results_checkbox:
                         gameday_obj = {
                             "gameday_id": d.get("gameday_id"),
@@ -472,7 +518,6 @@ if st.button("▶ Daten jetzt exportieren", type="primary"):
                         
                     structured_data[league_name]["gamedays"].append(gameday_obj)
                     
-                    # Gesamttabelle aktualisieren (Greift nur 1x pro Liga, da d.get("overall_standings") danach leer ist)
                     if d.get("overall_standings"):
                         structured_data[league_name]["overall_standings"] = d.get("overall_standings")
                         
